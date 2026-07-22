@@ -97,10 +97,15 @@ public final class GetReadableBuffer {
       long skipped = 0;
       while (skipped < toRead) {
         final long n = stream.skip(toRead - skipped);
-        if (n <= 0) {
-          throw new IOException("Failed to skip past consumed bytes in the gRPC stream");
+        if (n > 0) {
+          skipped += n;
+        } else if (stream.read() == -1) {
+          throw new IOException("Unexpected end of stream while consuming copied bytes");
+        } else {
+          // InputStream.skip() is permitted to return zero without reaching EOF. We have already
+          // copied this byte, so read it only to guarantee that the stream makes progress.
+          skipped++;
         }
-        skipped += n;
       }
       writeIndex += toRead;
       remaining -= toRead;

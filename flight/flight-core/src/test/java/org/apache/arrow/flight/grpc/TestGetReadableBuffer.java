@@ -90,6 +90,17 @@ public class TestGetReadableBuffer {
     }
   }
 
+  /** The copy loop must progress when a valid InputStream returns zero from skip(). */
+  @Test
+  public void testFastPathSkipReturnsZero() throws IOException {
+    final byte[] payload = payload(32);
+    try (ChunkedStream stream = new ChunkedStream(true, payload);
+        ArrowBuf buf = allocator.buffer(payload.length)) {
+      GetReadableBuffer.readIntoBuffer(stream, buf, payload.length, true);
+      assertArrayEquals(payload, toBytes(buf, payload.length));
+    }
+  }
+
   /** A truncated stream must fail loudly rather than leave the buffer partially filled. */
   @Test
   public void testFastPathTruncatedStream() throws IOException {
@@ -145,8 +156,14 @@ public class TestGetReadableBuffer {
    */
   private static final class ChunkedStream extends InputStream implements HasByteBuffer {
     private final Deque<ByteBuffer> chunks = new ArrayDeque<>();
+    private boolean skipReturnsZero;
 
     ChunkedStream(byte[]... chunks) {
+      this(false, chunks);
+    }
+
+    ChunkedStream(boolean skipReturnsZero, byte[]... chunks) {
+      this.skipReturnsZero = skipReturnsZero;
       for (byte[] chunk : chunks) {
         this.chunks.add(ByteBuffer.wrap(chunk));
       }
@@ -166,6 +183,10 @@ public class TestGetReadableBuffer {
 
     @Override
     public long skip(long n) {
+      if (skipReturnsZero) {
+        skipReturnsZero = false;
+        return 0;
+      }
       final ByteBuffer head = chunks.peek();
       if (head == null) {
         return 0;
