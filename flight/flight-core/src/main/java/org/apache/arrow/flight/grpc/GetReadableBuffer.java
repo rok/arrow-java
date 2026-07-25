@@ -31,13 +31,10 @@ import org.apache.arrow.memory.ArrowBuf;
  * {@code byte[]} allocation and the extra copy that goes with it. Otherwise, we fall back to
  * reading the stream into a heap array.
  *
- * <p>This relies on gRPC's public zero-copy APIs ({@link HasByteBuffer#getByteBuffer()} and
- * {@link InputStream#skip(long)}). No longer access gRPC internals via reflection. See
- * <a href="https://github.com/apache/arrow-java/issues/939">apache/arrow-java#939</a>.
+ * <p>This relies on gRPC's public buffer APIs ({@link HasByteBuffer#getByteBuffer()} and {@link
+ * InputStream#skip(long)}) instead of accessing gRPC internals through reflection.
  */
-public final class GetReadableBuffer {
-
-  private GetReadableBuffer() {}
+public class GetReadableBuffer {
 
   /**
    * Helper method to read a gRPC-provided InputStream into an ArrowBuf.

@@ -23,7 +23,10 @@ import com.google.protobuf.ByteString;
 import com.google.protobuf.CodedInputStream;
 import com.google.protobuf.CodedOutputStream;
 import com.google.protobuf.WireFormat;
+import io.grpc.Detachable;
 import io.grpc.Drainable;
+import io.grpc.HasByteBuffer;
+import io.grpc.KnownLength;
 import io.grpc.MethodDescriptor.Marshaller;
 import io.grpc.protobuf.ProtoUtils;
 import io.netty.buffer.ByteBuf;
@@ -46,6 +49,8 @@ import org.apache.arrow.flight.impl.Flight.FlightData;
 import org.apache.arrow.flight.impl.Flight.FlightDescriptor;
 import org.apache.arrow.memory.ArrowBuf;
 import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.memory.ForeignAllocation;
+import org.apache.arrow.memory.util.MemoryUtil;
 import org.apache.arrow.util.AutoCloseables;
 import org.apache.arrow.util.Preconditions;
 import org.apache.arrow.vector.ipc.message.ArrowDictionaryBatch;
@@ -280,12 +285,22 @@ class ArrowMessage implements AutoCloseable {
   }
 
   private static ArrowMessage frame(BufferAllocator allocator, final InputStream stream) {
+    if (ENABLE_ZERO_COPY_READ) {
+      final ArrowBufInputStream detached = ArrowBufInputStream.tryCreate(allocator, stream);
+      if (detached != null) {
+        try {
+          return frame(allocator, detached);
+        } finally {
+          detached.close();
+        }
+      }
+    }
 
+    FlightDescriptor descriptor = null;
+    MessageMetadataResult header = null;
+    ArrowBuf body = null;
+    ArrowBuf appMetadata = null;
     try {
-      FlightDescriptor descriptor = null;
-      MessageMetadataResult header = null;
-      ArrowBuf body = null;
-      ArrowBuf appMetadata = null;
       while (stream.available() > 0) {
         final int tagFirstByte = stream.read();
         if (tagFirstByte == -1) {
@@ -311,20 +326,22 @@ class ArrowMessage implements AutoCloseable {
             }
           case APP_METADATA_TAG:
             {
+              if (appMetadata != null) {
+                appMetadata.close();
+                appMetadata = null;
+              }
               int size = readRawVarint32(stream);
-              appMetadata = allocator.buffer(size);
-              GetReadableBuffer.readIntoBuffer(stream, appMetadata, size, ENABLE_ZERO_COPY_READ);
+              appMetadata = readBuffer(allocator, stream, size);
               break;
             }
           case BODY_TAG:
             if (body != null) {
               // only read last body.
-              body.getReferenceManager().release();
+              body.close();
               body = null;
             }
             int size = readRawVarint32(stream);
-            body = allocator.buffer(size);
-            GetReadableBuffer.readIntoBuffer(stream, body, size, ENABLE_ZERO_COPY_READ);
+            body = readBuffer(allocator, stream, size);
             break;
 
           default:
@@ -362,9 +379,18 @@ class ArrowMessage implements AutoCloseable {
             break;
         }
       }
-      return new ArrowMessage(descriptor, header, appMetadata, body);
+      final ArrowMessage result = new ArrowMessage(descriptor, header, appMetadata, body);
+      appMetadata = null;
+      body = null;
+      return result;
     } catch (Exception ioe) {
       throw new RuntimeException(ioe);
+    } finally {
+      try {
+        AutoCloseables.closeNoChecked(appMetadata);
+      } finally {
+        AutoCloseables.closeNoChecked(body);
+      }
     }
   }
 
@@ -375,6 +401,140 @@ class ArrowMessage implements AutoCloseable {
 
   private static int readRawVarint32(int firstByte, InputStream is) throws IOException {
     return CodedInputStream.readRawVarint32(firstByte, is);
+  }
+
+  private static ArrowBuf readBuffer(
+      BufferAllocator allocator, InputStream stream, int size) throws IOException {
+    if (stream instanceof ArrowBufInputStream) {
+      return ((ArrowBufInputStream) stream).readArrowBuf(size);
+    }
+
+    final ArrowBuf buffer = allocator.buffer(size);
+    try {
+      GetReadableBuffer.readIntoBuffer(stream, buffer, size, ENABLE_ZERO_COPY_READ);
+      return buffer;
+    } catch (IOException | RuntimeException | Error e) {
+      buffer.close();
+      throw e;
+    }
+  }
+
+  /** An InputStream over an owned gRPC buffer that can return zero-copy ArrowBuf slices. */
+  private static final class ArrowBufInputStream extends InputStream {
+    private final ArrowBuf buffer;
+    private final int length;
+    private int position;
+
+    private ArrowBufInputStream(ArrowBuf buffer, int length) {
+      this.buffer = buffer;
+      this.length = length;
+    }
+
+    private static ArrowBufInputStream tryCreate(
+        BufferAllocator allocator, InputStream stream) {
+      if (!(stream instanceof Detachable)
+          || !(stream instanceof HasByteBuffer)
+          || !(stream instanceof KnownLength)
+          || !((HasByteBuffer) stream).byteBufferSupported()) {
+        return null;
+      }
+
+      final ByteBuffer current = ((HasByteBuffer) stream).getByteBuffer();
+      final int size;
+      try {
+        size = stream.available();
+      } catch (IOException e) {
+        throw new RuntimeException("Failed to inspect gRPC input buffer", e);
+      }
+      if (current == null
+          || !current.isDirect()
+          || size == 0
+          || current.remaining() != size) {
+        return null;
+      }
+
+      final InputStream detached = ((Detachable) stream).detach();
+      final ByteBuffer detachedBuffer;
+      final long dataAddress;
+      try {
+        if (!(detached instanceof HasByteBuffer)
+            || !((HasByteBuffer) detached).byteBufferSupported()) {
+          throw new IllegalStateException("Detached gRPC stream does not expose its ByteBuffer");
+        }
+        detachedBuffer = ((HasByteBuffer) detached).getByteBuffer();
+        if (detachedBuffer == null
+            || !detachedBuffer.isDirect()
+            || detachedBuffer.remaining() != size) {
+          throw new IllegalStateException("Detached gRPC input buffer changed after detaching");
+        }
+        dataAddress =
+            MemoryUtil.getByteBufferAddress(detachedBuffer) + detachedBuffer.position();
+      } catch (RuntimeException | Error e) {
+        AutoCloseables.closeNoChecked(detached);
+        throw e;
+      }
+
+      final ArrowBuf buffer =
+          allocator.wrapForeignAllocation(
+              new ForeignAllocation(size, dataAddress) {
+                @Override
+                protected void release0() {
+                  AutoCloseables.closeNoChecked(detached);
+                }
+              });
+      return new ArrowBufInputStream(buffer, size);
+    }
+
+    private ArrowBuf readArrowBuf(int size) throws IOException {
+      if (size < 0 || size > available()) {
+        throw new IOException("Unexpected end of detached gRPC input buffer");
+      }
+      final int offset = position;
+      position += size;
+      buffer.getReferenceManager().retain();
+      try {
+        return buffer.slice(offset, size);
+      } catch (RuntimeException | Error e) {
+        buffer.getReferenceManager().release();
+        throw e;
+      }
+    }
+
+    @Override
+    public int available() {
+      return length - position;
+    }
+
+    @Override
+    public int read() {
+      return position == length ? -1 : buffer.getByte(position++) & 0xFF;
+    }
+
+    @Override
+    public int read(byte[] bytes, int offset, int size) {
+      if (size == 0) {
+        return 0;
+      }
+      final int read = Math.min(size, available());
+      if (read == 0) {
+        return -1;
+      }
+      buffer.getBytes(position, bytes, offset, read);
+      position += read;
+      return read;
+    }
+
+    @Override
+    public long skip(long size) {
+      final int skipped = (int) Math.min(Math.max(size, 0), available());
+      position += skipped;
+      return skipped;
+    }
+
+    @Override
+    public void close() {
+      buffer.close();
+    }
   }
 
   /**

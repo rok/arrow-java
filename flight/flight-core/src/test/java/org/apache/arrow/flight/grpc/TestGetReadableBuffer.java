@@ -73,8 +73,8 @@ public class TestGetReadableBuffer {
   }
 
   /**
-   * A chunk may hold more than the caller asked for (like next field bytes). Only {@code
-   * size} bytes may be consumed, the rest must remain readable.
+   * A chunk may hold more than the caller asked for (like next field bytes). Only {@code size}
+   * bytes may be consumed, the rest must remain readable.
    */
   @Test
   public void testFastPathDoesNotOverConsume() throws IOException {
@@ -106,11 +106,12 @@ public class TestGetReadableBuffer {
   public void testFastPathTruncatedStream() throws IOException {
     try (ChunkedStream stream = new ChunkedStream(payload(10));
         ArrowBuf buf = allocator.buffer(32)) {
-      assertThrows(IOException.class, () -> GetReadableBuffer.readIntoBuffer(stream, buf, 32, true));
+      assertThrows(
+          IOException.class, () -> GetReadableBuffer.readIntoBuffer(stream, buf, 32, true));
     }
   }
 
-  /** Both take the heap-array path: streams without zero-copy support, and fastPath=false. */
+  /** Both take the heap-array path: streams without ByteBuffer support, and fastPath=false. */
   @Test
   public void testSlowPath() throws IOException {
     final byte[] payload = payload(33);
@@ -151,8 +152,8 @@ public class TestGetReadableBuffer {
   }
 
   /**
-   * For gRPC's buffer-backed streams: {@link #getByteBuffer()} exposes the next chunk
-   * and {@link #skip(long)} advances.
+   * For gRPC's buffer-backed streams: {@link #getByteBuffer()} exposes the next chunk and {@link
+   * #skip(long)} advances.
    */
   private static final class ChunkedStream extends InputStream implements HasByteBuffer {
     private final Deque<ByteBuffer> chunks = new ArrayDeque<>();
