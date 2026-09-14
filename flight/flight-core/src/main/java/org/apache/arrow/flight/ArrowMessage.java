@@ -403,8 +403,8 @@ class ArrowMessage implements AutoCloseable {
     return CodedInputStream.readRawVarint32(firstByte, is);
   }
 
-  private static ArrowBuf readBuffer(
-      BufferAllocator allocator, InputStream stream, int size) throws IOException {
+  private static ArrowBuf readBuffer(BufferAllocator allocator, InputStream stream, int size)
+      throws IOException {
     if (stream instanceof ArrowBufInputStream) {
       return ((ArrowBufInputStream) stream).readArrowBuf(size);
     }
@@ -430,8 +430,7 @@ class ArrowMessage implements AutoCloseable {
       this.length = length;
     }
 
-    private static ArrowBufInputStream tryCreate(
-        BufferAllocator allocator, InputStream stream) {
+    private static ArrowBufInputStream tryCreate(BufferAllocator allocator, InputStream stream) {
       if (!(stream instanceof Detachable)
           || !(stream instanceof HasByteBuffer)
           || !(stream instanceof KnownLength)
@@ -446,10 +445,7 @@ class ArrowMessage implements AutoCloseable {
       } catch (IOException e) {
         throw new RuntimeException("Failed to inspect gRPC input buffer", e);
       }
-      if (current == null
-          || !current.isDirect()
-          || size == 0
-          || current.remaining() != size) {
+      if (current == null || !current.isDirect() || size == 0 || current.remaining() != size) {
         return null;
       }
 
@@ -467,8 +463,7 @@ class ArrowMessage implements AutoCloseable {
             || detachedBuffer.remaining() != size) {
           throw new IllegalStateException("Detached gRPC input buffer changed after detaching");
         }
-        dataAddress =
-            MemoryUtil.getByteBufferAddress(detachedBuffer) + detachedBuffer.position();
+        dataAddress = MemoryUtil.getByteBufferAddress(detachedBuffer) + detachedBuffer.position();
       } catch (RuntimeException | Error e) {
         AutoCloseables.closeNoChecked(detached);
         throw e;

@@ -89,8 +89,7 @@ public class TestArrowMessageDetachable {
     final ByteArrayOutputStream output = new ByteArrayOutputStream();
     final CodedOutputStream coded = CodedOutputStream.newInstance(output);
     coded.writeBytes(FlightData.DATA_BODY_FIELD_NUMBER, ByteString.copyFrom(payload(8)));
-    coded.writeTag(
-        FlightData.FLIGHT_DESCRIPTOR_FIELD_NUMBER, WireFormat.WIRETYPE_LENGTH_DELIMITED);
+    coded.writeTag(FlightData.FLIGHT_DESCRIPTOR_FIELD_NUMBER, WireFormat.WIRETYPE_LENGTH_DELIMITED);
     coded.writeUInt32NoTag(10);
     coded.writeRawByte(1);
     coded.flush();
