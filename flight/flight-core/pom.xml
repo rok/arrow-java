@@ -61,6 +61,7 @@ under the License.
     <dependency>
       <groupId>io.grpc</groupId>
       <artifactId>grpc-core</artifactId>
+      <!-- Only reached by name at runtime (AddWritableBuffer); nothing compiles against it. -->
       <scope>runtime</scope>
     </dependency>
     <dependency>

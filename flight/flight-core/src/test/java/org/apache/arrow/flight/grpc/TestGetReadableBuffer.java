@@ -19,9 +19,10 @@ package org.apache.arrow.flight.grpc;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.grpc.HasByteBuffer;
-import java.io.ByteArrayInputStream;
+import io.grpc.KnownLength;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.ByteBuffer;
@@ -35,7 +36,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
-/** Tests for reading a gRPC-provided {@link InputStream} into an {@link ArrowBuf}. */
+/** Tests for reading gRPC message bodies into an {@link ArrowBuf} through gRPC's public API. */
 public class TestGetReadableBuffer {
 
   private BufferAllocator allocator;
@@ -47,177 +48,224 @@ public class TestGetReadableBuffer {
 
   @AfterEach
   public void tearDown() {
+    assertEquals(0, allocator.getAllocatedMemory());
     allocator.close();
   }
 
   @Test
-  public void testFastPathSingleChunk() throws IOException {
+  public void fastPathReadsThroughByteBuffersNotThroughHeapReads() throws IOException {
     final byte[] payload = payload(64);
     try (ChunkedStream stream = new ChunkedStream(payload);
         ArrowBuf buf = allocator.buffer(payload.length)) {
       GetReadableBuffer.readIntoBuffer(stream, buf, payload.length, true);
-      assertEquals(payload.length, buf.writerIndex());
-      assertArrayEquals(payload, toBytes(buf, payload.length));
+
+      assertArrayEquals(payload, contents(buf));
+      assertEquals(0, stream.available());
+      assertEquals(0, stream.heapReads, "fast path must not go through InputStream.read");
+      assertTrue(stream.byteBufferPeeks > 0, "fast path must use HasByteBuffer.getByteBuffer");
     }
   }
 
-  /** Copy loop stitches several backing buffers of the requested size. */
   @Test
-  public void testFastPathAcrossChunks() throws IOException {
-    final byte[] payload = payload(70);
-    try (ChunkedStream stream = new ChunkedStream(slice(payload, 10, 1, 32, 27));
-        ArrowBuf buf = allocator.buffer(payload.length)) {
-      GetReadableBuffer.readIntoBuffer(stream, buf, payload.length, true);
-      assertArrayEquals(payload, toBytes(buf, payload.length));
-    }
-  }
-
-  /**
-   * A chunk may hold more than the caller asked for (like next field bytes). Only {@code size}
-   * bytes may be consumed, the rest must remain readable.
-   */
-  @Test
-  public void testFastPathDoesNotOverConsume() throws IOException {
+  public void fastPathToleratesSkipReturningZero() throws IOException {
     final byte[] payload = payload(48);
-    try (ChunkedStream stream = new ChunkedStream(payload);
-        ArrowBuf buf = allocator.buffer(20)) {
-      GetReadableBuffer.readIntoBuffer(stream, buf, 20, true);
-      assertArrayEquals(Arrays.copyOf(payload, 20), toBytes(buf, 20));
-
-      final byte[] rest = new byte[payload.length - 20];
-      assertEquals(rest.length, stream.read(rest));
-      assertArrayEquals(Arrays.copyOfRange(payload, 20, payload.length), rest);
-    }
-  }
-
-  /** The copy loop must progress when a valid InputStream returns zero from skip(). */
-  @Test
-  public void testFastPathSkipReturnsZero() throws IOException {
-    final byte[] payload = payload(32);
     try (ChunkedStream stream = new ChunkedStream(true, payload);
         ArrowBuf buf = allocator.buffer(payload.length)) {
       GetReadableBuffer.readIntoBuffer(stream, buf, payload.length, true);
-      assertArrayEquals(payload, toBytes(buf, payload.length));
+
+      assertArrayEquals(payload, contents(buf));
+      assertEquals(0, stream.available());
     }
   }
 
-  /** A truncated stream must fail loudly rather than leave the buffer partially filled. */
   @Test
-  public void testFastPathTruncatedStream() throws IOException {
-    try (ChunkedStream stream = new ChunkedStream(payload(10));
-        ArrowBuf buf = allocator.buffer(32)) {
-      assertThrows(
-          IOException.class, () -> GetReadableBuffer.readIntoBuffer(stream, buf, 32, true));
+  public void fastPathCopiesAcrossChunkBoundaries() throws IOException {
+    final byte[] payload = payload(70);
+    try (ChunkedStream stream = new ChunkedStream(split(payload, 10, 1, 32, 27));
+        ArrowBuf buf = allocator.buffer(payload.length)) {
+      GetReadableBuffer.readIntoBuffer(stream, buf, payload.length, true);
+
+      assertArrayEquals(payload, contents(buf));
+      assertEquals(0, stream.available());
+      assertEquals(0, stream.heapReads);
     }
   }
 
-  /** Both take the heap-array path: streams without ByteBuffer support, and fastPath=false. */
   @Test
-  public void testSlowPath() throws IOException {
-    final byte[] payload = payload(33);
-    try (ArrowBuf buf = allocator.buffer(payload.length)) {
-      GetReadableBuffer.readIntoBuffer(
-          new ByteArrayInputStream(payload), buf, payload.length, true);
-      assertArrayEquals(payload, toBytes(buf, payload.length));
+  public void fastPathReadsOnlyTheRequestedBytes() throws IOException {
+    final byte[] payload = payload(40);
+    try (ChunkedStream stream = new ChunkedStream(split(payload, 16, 24));
+        ArrowBuf buf = allocator.buffer(20)) {
+      GetReadableBuffer.readIntoBuffer(stream, buf, 20, true);
+
+      assertArrayEquals(Arrays.copyOf(payload, 20), contents(buf));
+      assertEquals(20, stream.available());
     }
+  }
+
+  @Test
+  public void fallsBackToHeapReadWhenByteBuffersAreNotSupported() throws IOException {
+    final byte[] payload = payload(24);
+    try (ChunkedStream stream = ChunkedStream.withoutByteBufferSupport(split(payload, 9, 15));
+        ArrowBuf buf = allocator.buffer(payload.length)) {
+      GetReadableBuffer.readIntoBuffer(stream, buf, payload.length, true);
+
+      assertArrayEquals(payload, contents(buf));
+      assertEquals(0, stream.available());
+      assertEquals(0, stream.byteBufferPeeks, "must not call getByteBuffer when unsupported");
+      assertTrue(stream.heapReads > 0);
+    }
+  }
+
+  @Test
+  public void fastPathDisabledUsesHeapRead() throws IOException {
+    final byte[] payload = payload(24);
     try (ChunkedStream stream = new ChunkedStream(payload);
         ArrowBuf buf = allocator.buffer(payload.length)) {
       GetReadableBuffer.readIntoBuffer(stream, buf, payload.length, false);
-      assertArrayEquals(payload, toBytes(buf, payload.length));
+
+      assertArrayEquals(payload, contents(buf));
+      assertEquals(0, stream.byteBufferPeeks, "fastPath=false must not touch HasByteBuffer");
+      assertTrue(stream.heapReads > 0);
     }
+  }
+
+  @Test
+  public void fastPathThrowsWhenStreamEndsEarly() throws IOException {
+    final byte[] payload = payload(10);
+    try (ChunkedStream stream = new ChunkedStream(payload);
+        ArrowBuf buf = allocator.buffer(16)) {
+      assertThrows(
+          IOException.class, () -> GetReadableBuffer.readIntoBuffer(stream, buf, 16, true));
+    }
+  }
+
+  private static byte[][] split(byte[] payload, int... sizes) {
+    final byte[][] pieces = new byte[sizes.length][];
+    int offset = 0;
+    for (int i = 0; i < sizes.length; i++) {
+      pieces[i] = Arrays.copyOfRange(payload, offset, offset + sizes[i]);
+      offset += sizes[i];
+    }
+    if (offset != payload.length) {
+      throw new IllegalArgumentException("sizes must sum to payload length");
+    }
+    return pieces;
   }
 
   private static byte[] payload(int size) {
     final byte[] bytes = new byte[size];
     for (int i = 0; i < size; i++) {
-      bytes[i] = (byte) i;
+      bytes[i] = (byte) (i * 7 + 3);
     }
     return bytes;
   }
 
-  private static byte[] toBytes(ArrowBuf buf, int size) {
-    final byte[] bytes = new byte[size];
-    buf.getBytes(0, bytes);
-    return bytes;
-  }
-
-  private static byte[][] slice(byte[] payload, int... sizes) {
-    final byte[][] chunks = new byte[sizes.length][];
-    int offset = 0;
-    for (int i = 0; i < sizes.length; i++) {
-      chunks[i] = Arrays.copyOfRange(payload, offset, offset + sizes[i]);
-      offset += sizes[i];
-    }
-    return chunks;
+  private static byte[] contents(ArrowBuf buf) {
+    final byte[] out = new byte[(int) buf.writerIndex()];
+    buf.getBytes(0, out);
+    return out;
   }
 
   /**
-   * For gRPC's buffer-backed streams: {@link #getByteBuffer()} exposes the next chunk and {@link
-   * #skip(long)} advances.
+   * A stand-in for gRPC's message stream: a chain of direct buffers exposed through {@link
+   * HasByteBuffer} and {@link KnownLength}, with counters for how it was read.
    */
-  private static final class ChunkedStream extends InputStream implements HasByteBuffer {
+  static final class ChunkedStream extends InputStream implements HasByteBuffer, KnownLength {
     private final Deque<ByteBuffer> chunks = new ArrayDeque<>();
-    private boolean skipReturnsZero;
+    private final boolean skipReturnsZeroEveryOtherCall;
+    private final boolean byteBufferSupported;
+    private boolean returnZeroFromNextSkip;
+    int heapReads;
+    int byteBufferPeeks;
 
-    ChunkedStream(byte[]... chunks) {
-      this(false, chunks);
+    ChunkedStream(byte[]... pieces) {
+      this(false, true, pieces);
     }
 
-    ChunkedStream(boolean skipReturnsZero, byte[]... chunks) {
-      this.skipReturnsZero = skipReturnsZero;
-      for (byte[] chunk : chunks) {
-        this.chunks.add(ByteBuffer.wrap(chunk));
+    ChunkedStream(boolean skipReturnsZeroEveryOtherCall, byte[]... pieces) {
+      this(skipReturnsZeroEveryOtherCall, true, pieces);
+    }
+
+    static ChunkedStream withoutByteBufferSupport(byte[]... pieces) {
+      return new ChunkedStream(false, false, pieces);
+    }
+
+    private ChunkedStream(
+        boolean skipReturnsZeroEveryOtherCall, boolean byteBufferSupported, byte[]... pieces) {
+      this.skipReturnsZeroEveryOtherCall = skipReturnsZeroEveryOtherCall;
+      this.byteBufferSupported = byteBufferSupported;
+      this.returnZeroFromNextSkip = skipReturnsZeroEveryOtherCall;
+      for (byte[] piece : pieces) {
+        final ByteBuffer chunk = ByteBuffer.allocateDirect(piece.length);
+        chunk.put(piece).flip();
+        chunks.add(chunk);
       }
     }
 
-    @Override
-    public boolean byteBufferSupported() {
-      return true;
-    }
-
-    @Override
-    public ByteBuffer getByteBuffer() {
-      final ByteBuffer head = chunks.peek();
-      // Like gRPC, hand out an independent view so the caller may adjust position/limit freely.
-      return head == null ? null : head.duplicate();
-    }
-
-    @Override
-    public long skip(long n) {
-      if (skipReturnsZero) {
-        skipReturnsZero = false;
-        return 0;
-      }
-      final ByteBuffer head = chunks.peek();
-      if (head == null) {
-        return 0;
-      }
-      final int skipped = (int) Math.min(n, head.remaining());
-      head.position(head.position() + skipped);
-      if (!head.hasRemaining()) {
+    private ByteBuffer current() {
+      while (!chunks.isEmpty() && !chunks.peek().hasRemaining()) {
         chunks.poll();
       }
-      return skipped;
+      return chunks.peek();
     }
 
     @Override
     public int read() {
-      final byte[] one = new byte[1];
-      return read(one, 0, 1) == 1 ? one[0] & 0xFF : -1;
+      final ByteBuffer chunk = current();
+      return chunk == null ? -1 : chunk.get() & 0xFF;
     }
 
     @Override
-    public int read(byte[] dst, int off, int len) {
-      final ByteBuffer head = chunks.peek();
-      if (head == null) {
+    public int read(byte[] b, int off, int len) {
+      heapReads++;
+      final ByteBuffer chunk = current();
+      if (chunk == null) {
         return -1;
       }
-      final int read = Math.min(len, head.remaining());
-      head.get(dst, off, read);
-      if (!head.hasRemaining()) {
-        chunks.poll();
+      final int n = Math.min(len, chunk.remaining());
+      chunk.get(b, off, n);
+      return n;
+    }
+
+    @Override
+    public long skip(long n) {
+      if (skipReturnsZeroEveryOtherCall) {
+        returnZeroFromNextSkip = !returnZeroFromNextSkip;
+        if (!returnZeroFromNextSkip) {
+          // InputStream.skip may legitimately return 0 before end of stream.
+          return 0;
+        }
       }
-      return read;
+      final ByteBuffer chunk = current();
+      if (chunk == null) {
+        return 0;
+      }
+      // Like gRPC, skip at most one chunk per call.
+      final int skipped = (int) Math.min(n, chunk.remaining());
+      chunk.position(chunk.position() + skipped);
+      return skipped;
+    }
+
+    @Override
+    public int available() {
+      int total = 0;
+      for (ByteBuffer chunk : chunks) {
+        total += chunk.remaining();
+      }
+      return total;
+    }
+
+    @Override
+    public boolean byteBufferSupported() {
+      return byteBufferSupported;
+    }
+
+    @Override
+    public ByteBuffer getByteBuffer() {
+      byteBufferPeeks++;
+      final ByteBuffer chunk = current();
+      return chunk == null ? null : chunk.duplicate();
     }
   }
 }
