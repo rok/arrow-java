@@ -286,21 +286,23 @@ class ArrowMessage implements AutoCloseable {
 
   private static ArrowMessage frame(BufferAllocator allocator, final InputStream stream) {
     if (ENABLE_ZERO_COPY_READ) {
-      final ArrowBufInputStream detached = ArrowBufInputStream.tryCreate(allocator, stream);
-      if (detached != null) {
+      // If gRPC lets us take ownership of the whole message, parse it in place: the same loop
+      // below then runs over our own buffer and hands out slices instead of copies.
+      final OwnedFrame owned = OwnedFrame.tryTakeOwnership(allocator, stream);
+      if (owned != null) {
         try {
-          return frame(allocator, detached);
+          return frame(allocator, owned);
         } finally {
-          detached.close();
+          owned.close();
         }
       }
     }
 
-    FlightDescriptor descriptor = null;
-    MessageMetadataResult header = null;
     ArrowBuf body = null;
     ArrowBuf appMetadata = null;
     try {
+      FlightDescriptor descriptor = null;
+      MessageMetadataResult header = null;
       while (stream.available() > 0) {
         final int tagFirstByte = stream.read();
         if (tagFirstByte == -1) {
@@ -326,10 +328,6 @@ class ArrowMessage implements AutoCloseable {
             }
           case APP_METADATA_TAG:
             {
-              if (appMetadata != null) {
-                appMetadata.close();
-                appMetadata = null;
-              }
               int size = readRawVarint32(stream);
               appMetadata = readBuffer(allocator, stream, size);
               break;
@@ -337,7 +335,7 @@ class ArrowMessage implements AutoCloseable {
           case BODY_TAG:
             if (body != null) {
               // only read last body.
-              body.close();
+              body.getReferenceManager().release();
               body = null;
             }
             int size = readRawVarint32(stream);
@@ -379,18 +377,17 @@ class ArrowMessage implements AutoCloseable {
             break;
         }
       }
-      final ArrowMessage result = new ArrowMessage(descriptor, header, appMetadata, body);
+      final ArrowMessage message = new ArrowMessage(descriptor, header, appMetadata, body);
+      // Ownership of the buffers has moved into the message.
       appMetadata = null;
       body = null;
-      return result;
+      return message;
     } catch (Exception ioe) {
       throw new RuntimeException(ioe);
     } finally {
-      try {
-        AutoCloseables.closeNoChecked(appMetadata);
-      } finally {
-        AutoCloseables.closeNoChecked(body);
-      }
+      // Only non-null if parsing failed part-way through.
+      AutoCloseables.closeNoChecked(appMetadata);
+      AutoCloseables.closeNoChecked(body);
     }
   }
 
@@ -399,16 +396,12 @@ class ArrowMessage implements AutoCloseable {
     return readRawVarint32(firstByte, is);
   }
 
-  private static int readRawVarint32(int firstByte, InputStream is) throws IOException {
-    return CodedInputStream.readRawVarint32(firstByte, is);
-  }
-
+  /** Read {@code size} bytes of a length-delimited field into a buffer the caller must close. */
   private static ArrowBuf readBuffer(BufferAllocator allocator, InputStream stream, int size)
       throws IOException {
-    if (stream instanceof ArrowBufInputStream) {
-      return ((ArrowBufInputStream) stream).readArrowBuf(size);
+    if (stream instanceof OwnedFrame) {
+      return ((OwnedFrame) stream).slice(size);
     }
-
     final ArrowBuf buffer = allocator.buffer(size);
     try {
       GetReadableBuffer.readIntoBuffer(stream, buffer, size, ENABLE_ZERO_COPY_READ);
@@ -419,80 +412,125 @@ class ArrowMessage implements AutoCloseable {
     }
   }
 
-  /** An InputStream over an owned gRPC buffer that can return zero-copy ArrowBuf slices. */
-  private static final class ArrowBufInputStream extends InputStream {
-    private final ArrowBuf buffer;
+  /**
+   * A gRPC message we own outright, readable as a stream and sliceable without copying.
+   *
+   * <p>gRPC closes the stream it passes to a marshaller as soon as parsing returns, so a buffer
+   * merely borrowed through {@link HasByteBuffer} cannot outlive {@code parse()}. {@link
+   * Detachable#detach()} transfers ownership of the buffer to us; we wrap that memory as a foreign
+   * allocation whose release closes the detached stream, and hand out retained slices of it. The
+   * memory goes back to gRPC once the message and every slice are closed.
+   */
+  private static final class OwnedFrame extends InputStream {
+    private final ArrowBuf frame;
     private final int length;
     private int position;
 
-    private ArrowBufInputStream(ArrowBuf buffer, int length) {
-      this.buffer = buffer;
+    private OwnedFrame(ArrowBuf frame, int length) {
+      this.frame = frame;
       this.length = length;
     }
 
-    private static ArrowBufInputStream tryCreate(BufferAllocator allocator, InputStream stream) {
+    /**
+     * Take ownership of the stream's buffer if gRPC exposes it and it holds the entire message.
+     *
+     * @return the owned frame, or null to fall back to copying.
+     */
+    static OwnedFrame tryTakeOwnership(BufferAllocator allocator, InputStream stream) {
       if (!(stream instanceof Detachable)
           || !(stream instanceof HasByteBuffer)
           || !(stream instanceof KnownLength)
           || !((HasByteBuffer) stream).byteBufferSupported()) {
         return null;
       }
-
-      final ByteBuffer current = ((HasByteBuffer) stream).getByteBuffer();
       final int size;
       try {
         size = stream.available();
       } catch (IOException e) {
-        throw new RuntimeException("Failed to inspect gRPC input buffer", e);
+        throw new RuntimeException("Failed to query gRPC stream length", e);
       }
-      if (current == null || !current.isDirect() || size == 0 || current.remaining() != size) {
+      final ByteBuffer peek = ((HasByteBuffer) stream).getByteBuffer();
+      if (peek == null || !peek.isDirect() || size == 0 || peek.remaining() != size) {
+        // Empty, on-heap, or split across several buffers: only a single direct buffer holding
+        // the whole message can be wrapped.
         return null;
       }
 
-      final InputStream detached = ((Detachable) stream).detach();
-      final ByteBuffer detachedBuffer;
-      final long dataAddress;
+      final InputStream owner = ((Detachable) stream).detach();
+      final long address;
       try {
-        if (!(detached instanceof HasByteBuffer)
-            || !((HasByteBuffer) detached).byteBufferSupported()) {
-          throw new IllegalStateException("Detached gRPC stream does not expose its ByteBuffer");
+        if (!(owner instanceof HasByteBuffer) || !((HasByteBuffer) owner).byteBufferSupported()) {
+          throw new IllegalStateException("Detached gRPC stream does not expose its buffer");
         }
-        detachedBuffer = ((HasByteBuffer) detached).getByteBuffer();
-        if (detachedBuffer == null
-            || !detachedBuffer.isDirect()
-            || detachedBuffer.remaining() != size) {
-          throw new IllegalStateException("Detached gRPC input buffer changed after detaching");
+        final ByteBuffer owned = ((HasByteBuffer) owner).getByteBuffer();
+        if (owned == null || !owned.isDirect() || owned.remaining() != size) {
+          throw new IllegalStateException("Detached gRPC buffer differs from the one inspected");
         }
-        dataAddress = MemoryUtil.getByteBufferAddress(detachedBuffer) + detachedBuffer.position();
+        address = MemoryUtil.getByteBufferAddress(owned) + owned.position();
       } catch (RuntimeException | Error e) {
-        AutoCloseables.closeNoChecked(detached);
+        AutoCloseables.closeNoChecked(owner);
         throw e;
       }
 
-      final ArrowBuf buffer =
-          allocator.wrapForeignAllocation(
-              new ForeignAllocation(size, dataAddress) {
-                @Override
-                protected void release0() {
-                  AutoCloseables.closeNoChecked(detached);
-                }
-              });
-      return new ArrowBufInputStream(buffer, size);
+      final ArrowBuf frame;
+      try {
+        frame =
+            allocator.wrapForeignAllocation(
+                new ForeignAllocation(size, address) {
+                  @Override
+                  protected void release0() {
+                    AutoCloseables.closeNoChecked(owner);
+                  }
+                });
+      } catch (RuntimeException | Error e) {
+        // wrapForeignAllocation failed before adopting the allocation, so release0 will not run.
+        AutoCloseables.closeNoChecked(owner);
+        throw e;
+      }
+      return new OwnedFrame(frame, size);
     }
 
-    private ArrowBuf readArrowBuf(int size) throws IOException {
+    /** A zero-copy view of the next {@code size} bytes; the caller owns the returned buffer. */
+    ArrowBuf slice(int size) throws IOException {
       if (size < 0 || size > available()) {
-        throw new IOException("Unexpected end of detached gRPC input buffer");
+        throw new IOException("Unexpected end of gRPC message");
       }
       final int offset = position;
       position += size;
-      buffer.getReferenceManager().retain();
+      // A slice shares the frame's reference count, so give it its own reference first.
+      frame.getReferenceManager().retain();
       try {
-        return buffer.slice(offset, size);
+        return frame.slice(offset, size);
       } catch (RuntimeException | Error e) {
-        buffer.getReferenceManager().release();
+        frame.getReferenceManager().release();
         throw e;
       }
+    }
+
+    @Override
+    public int read() {
+      if (position >= length) {
+        return -1;
+      }
+      return frame.getByte(position++) & 0xFF;
+    }
+
+    @Override
+    public int read(byte[] b, int off, int len) {
+      if (position >= length) {
+        return -1;
+      }
+      final int n = Math.min(len, available());
+      frame.getBytes(position, b, off, n);
+      position += n;
+      return n;
+    }
+
+    @Override
+    public long skip(long n) {
+      final int skipped = (int) Math.min(n, available());
+      position += skipped;
+      return skipped;
     }
 
     @Override
@@ -501,35 +539,13 @@ class ArrowMessage implements AutoCloseable {
     }
 
     @Override
-    public int read() {
-      return position == length ? -1 : buffer.getByte(position++) & 0xFF;
-    }
-
-    @Override
-    public int read(byte[] bytes, int offset, int size) {
-      if (size == 0) {
-        return 0;
-      }
-      final int read = Math.min(size, available());
-      if (read == 0) {
-        return -1;
-      }
-      buffer.getBytes(position, bytes, offset, read);
-      position += read;
-      return read;
-    }
-
-    @Override
-    public long skip(long size) {
-      final int skipped = (int) Math.min(Math.max(size, 0), available());
-      position += skipped;
-      return skipped;
-    }
-
-    @Override
     public void close() {
-      buffer.close();
+      frame.close();
     }
+  }
+
+  private static int readRawVarint32(int firstByte, InputStream is) throws IOException {
+    return CodedInputStream.readRawVarint32(firstByte, is);
   }
 
   /**
