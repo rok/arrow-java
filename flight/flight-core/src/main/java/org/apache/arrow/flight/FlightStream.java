@@ -480,6 +480,7 @@ public class FlightStream implements AutoCloseable {
           ex =
               new UnsupportedOperationException(
                   "Unable to handle message of type: " + msg.getMessageType());
+          AutoCloseables.closeNoChecked(msg);
           enqueue(DONE_EX);
       }
     }

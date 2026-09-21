@@ -16,84 +16,81 @@
  */
 package org.apache.arrow.flight.grpc;
 
-import com.google.common.base.Throwables;
 import com.google.common.io.ByteStreams;
-import io.grpc.internal.ReadableBuffer;
+import io.grpc.HasByteBuffer;
 import java.io.IOException;
 import java.io.InputStream;
-import java.lang.reflect.Field;
+import java.nio.ByteBuffer;
 import org.apache.arrow.memory.ArrowBuf;
 
 /**
- * Enable access to ReadableBuffer directly to copy data from a BufferInputStream into a target
- * ByteBuffer/ByteBuf.
+ * Reads a gRPC message body into an {@link ArrowBuf}.
  *
- * <p>This could be solved by BufferInputStream exposing Drainable.
+ * <p>When the stream gRPC hands us exposes its backing buffers through {@link HasByteBuffer}, the
+ * bytes are copied straight from those buffers into the target, skipping the intermediate heap
+ * array. Otherwise the stream is read into a heap array first.
  */
 public class GetReadableBuffer {
 
-  private static final Field READABLE_BUFFER;
-  private static final Class<?> BUFFER_INPUT_STREAM;
-
-  static {
-    Field tmpField = null;
-    Class<?> tmpClazz = null;
-    try {
-      Class<?> clazz = Class.forName("io.grpc.internal.ReadableBuffers$BufferInputStream");
-
-      Field f = clazz.getDeclaredField("buffer");
-      f.setAccessible(true);
-      // don't set until we've gotten past all exception cases.
-      tmpField = f;
-      tmpClazz = clazz;
-    } catch (Exception e) {
-      new RuntimeException("Failed to initialize GetReadableBuffer, falling back to slow path", e)
-          .printStackTrace();
-    }
-    READABLE_BUFFER = tmpField;
-    BUFFER_INPUT_STREAM = tmpClazz;
-  }
+  private GetReadableBuffer() {}
 
   /**
-   * Extracts the ReadableBuffer for the given input stream.
+   * Read exactly {@code size} bytes from {@code stream} into {@code buf}.
    *
-   * @param is Must be an instance of io.grpc.internal.ReadableBuffers$BufferInputStream or null
-   *     will be returned.
-   */
-  public static ReadableBuffer getReadableBuffer(InputStream is) {
-
-    if (BUFFER_INPUT_STREAM == null || !is.getClass().equals(BUFFER_INPUT_STREAM)) {
-      return null;
-    }
-
-    try {
-      return (ReadableBuffer) READABLE_BUFFER.get(is);
-    } catch (Exception ex) {
-      throw Throwables.propagate(ex);
-    }
-  }
-
-  /**
-   * Helper method to read a gRPC-provided InputStream into an ArrowBuf.
-   *
-   * @param stream The stream to read from. Should be an instance of {@link #BUFFER_INPUT_STREAM}.
-   * @param buf The buffer to read into.
+   * @param stream The stream to read from.
+   * @param buf The buffer to read into. Its writer index is set to {@code size} on success.
    * @param size The number of bytes to read.
-   * @param fastPath Whether to enable the fast path (i.e. detect whether the stream is a {@link
-   *     #BUFFER_INPUT_STREAM}).
-   * @throws IOException if there is an error reading form the stream
+   * @param fastPath Whether to copy directly from the stream's backing buffers when it exposes
+   *     them.
+   * @throws IOException if the stream ends early or cannot be read.
    */
   public static void readIntoBuffer(
       final InputStream stream, final ArrowBuf buf, final int size, final boolean fastPath)
       throws IOException {
-    ReadableBuffer readableBuffer = fastPath ? getReadableBuffer(stream) : null;
-    byte[] heapBytes = new byte[size];
-    if (readableBuffer != null) {
-      readableBuffer.readBytes(heapBytes, 0, size);
+    if (fastPath
+        && stream instanceof HasByteBuffer
+        && ((HasByteBuffer) stream).byteBufferSupported()) {
+      readFromByteBuffers((HasByteBuffer) stream, stream, buf, size);
     } else {
+      final byte[] heapBytes = new byte[size];
       ByteStreams.readFully(stream, heapBytes);
+      buf.setBytes(0, heapBytes);
     }
-    buf.writeBytes(heapBytes);
     buf.writerIndex(size);
+  }
+
+  private static void readFromByteBuffers(
+      final HasByteBuffer source, final InputStream stream, final ArrowBuf buf, final int size)
+      throws IOException {
+    int copied = 0;
+    while (copied < size) {
+      final ByteBuffer chunk = source.getByteBuffer();
+      if (chunk == null || !chunk.hasRemaining()) {
+        throw new IOException(
+            "Unexpected end of gRPC stream: expected " + size + " bytes, got " + copied);
+      }
+      final int toRead = Math.min(size - copied, chunk.remaining());
+      buf.setBytes(copied, chunk, chunk.position(), toRead);
+      // getByteBuffer() does not advance the stream; skip() consumes the bytes we just copied.
+      consume(stream, toRead);
+      copied += toRead;
+    }
+  }
+
+  private static void consume(final InputStream stream, final int count) throws IOException {
+    int skipped = 0;
+    while (skipped < count) {
+      final long n = stream.skip(count - skipped);
+      if (n > 0) {
+        skipped += (int) n;
+        continue;
+      }
+      // InputStream.skip is allowed to return 0 before the end of the stream. Force progress with
+      // a single-byte read, which does distinguish end of stream.
+      if (stream.read() == -1) {
+        throw new IOException("Unexpected end of gRPC stream while skipping copied bytes");
+      }
+      skipped++;
+    }
   }
 }
